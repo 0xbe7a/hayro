@@ -1,7 +1,8 @@
 use crate::font::UNITS_PER_EM;
 use crate::font::outline::OutlinePath;
-use hayro_font::{Matrix, cff, type1};
 use kurbo::{Affine, BezPath};
+use read_fonts::tables::postscript::font::{CffFontRef, CffSubfont, Type1Font};
+use read_fonts::types::Fixed;
 use skrifa::instance::{LocationRef, Size};
 use skrifa::metrics::GlyphMetrics;
 use skrifa::outline::{DrawSettings, Engine, HintingInstance, HintingOptions, Target};
@@ -16,8 +17,11 @@ type OpenTypeFontYoke = Yoke<OTFYoke<'static>, FontData>;
 type CffFontYoke = Yoke<CFFYoke<'static>, FontData>;
 
 /// A font blob for type 1 fonts.
+///
+/// Type1Font from read-fonts owns its data (uses Vec<u8> internally),
+/// so no Yoke is needed.
 #[derive(Clone)]
-pub(crate) struct Type1FontBlob(Arc<type1::Table>);
+pub(crate) struct Type1FontBlob(Arc<Type1Font>);
 
 impl Debug for Type1FontBlob {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -27,21 +31,25 @@ impl Debug for Type1FontBlob {
 
 impl Type1FontBlob {
     pub(crate) fn new(data: FontData) -> Option<Self> {
-        let table = type1::Table::parse(data.as_ref().as_ref())?;
-
+        let table = Type1Font::new(data.as_ref().as_ref()).ok()?;
         Some(Self(Arc::new(table)))
     }
 
-    pub(crate) fn table(&self) -> &type1::Table {
+    pub(crate) fn table(&self) -> &Type1Font {
         self.0.as_ref()
     }
 
-    pub(crate) fn outline_glyph(&self, name: &str) -> BezPath {
+    pub(crate) fn outline_glyph(&self, gid: GlyphId) -> BezPath {
         let mut path = OutlinePath::new();
 
-        self.table().outline(name, &mut path).unwrap_or_default();
+        let _ = self.table().evaluate_charstring(gid, &mut path);
 
-        Affine::scale(UNITS_PER_EM as f64) * convert_matrix(self.table().matrix()) * path.take()
+        let matrix = self.table().matrix();
+        let upem = self.table().upem();
+
+        Affine::scale(UNITS_PER_EM as f64)
+            * convert_font_matrix(&matrix.0, upem)
+            * path.take()
     }
 }
 
@@ -51,17 +59,18 @@ pub(crate) struct CffFontBlob(Arc<CffFontYoke>);
 
 impl Debug for CffFontBlob {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Type1 Font {{ .. }}")
+        write!(f, "CFF Font {{ .. }}")
     }
 }
 
 impl CffFontBlob {
     pub(crate) fn new(data: FontData) -> Option<Self> {
-        let _ = cff::Table::parse(data.as_ref().as_ref())?;
+        // Validate first
+        let _ = CffFontRef::new_cff(data.as_ref().as_ref(), 0).ok()?;
 
         let yoke = Yoke::<CFFYoke<'static>, FontData>::attach_to_cart(data.clone(), |data| {
-            let table = cff::Table::parse(data.as_ref()).unwrap();
-            CFFYoke { table }
+            let font = CffFontRef::new_cff(data.as_ref(), 0).unwrap();
+            CFFYoke { font }
         });
 
         Some(Self(Arc::new(yoke)))
@@ -71,22 +80,71 @@ impl CffFontBlob {
         self.0.backing_cart().clone()
     }
 
-    pub(crate) fn table(&self) -> &cff::Table<'_> {
-        &self.0.as_ref().get().table
+    pub(crate) fn table(&self) -> &CffFontRef<'_> {
+        &self.0.as_ref().get().font
     }
 
     pub(crate) fn outline_glyph(&self, glyph: GlyphId) -> BezPath {
         let mut path = OutlinePath::new();
+        let table = self.table();
 
-        let glyph_id = hayro_font::GlyphId(glyph.to_u32() as u16);
-
-        let Ok(_) = self.table().outline(glyph_id, &mut path) else {
+        let subfont_index = table.subfont_index(glyph).unwrap_or(0);
+        let Ok(subfont) = table.subfont(subfont_index, &[]) else {
             return BezPath::new();
         };
 
-        let matrix = self.table().glyph_matrix(glyph_id);
+        let _ = table.evaluate_charstring(&subfont, &[], glyph, &mut path);
 
-        Affine::scale(UNITS_PER_EM as f64) * convert_matrix(matrix) * path.take()
+        let matrix = self.compute_glyph_matrix(glyph, &subfont);
+
+        Affine::scale(UNITS_PER_EM as f64) * matrix * path.take()
+    }
+
+    /// Computes the effective glyph matrix, composing top-level and per-subfont
+    /// matrices. This replicates the logic from hayro-font's glyph_matrix().
+    ///
+    /// The key subtlety: read-fonts normalizes the FontMatrix by dividing out
+    /// the y-scale component and storing it as `scale` (upem). To get the
+    /// equivalent raw matrix that hayro-font used, we must divide each matrix
+    /// component by the scale.
+    fn compute_glyph_matrix(&self, _glyph: GlyphId, subfont: &CffSubfont) -> Affine {
+        let table = self.table();
+        let top = table.matrix();
+        let fd = subfont.matrix();
+
+        match (top, fd) {
+            (Some(top_matrix), Some(fd_matrix)) => {
+                // Both top and FD have matrices.
+                // Convert both to raw (de-normalized) form and compose.
+                let top_raw = convert_font_matrix(&top_matrix.matrix.0, top_matrix.scale);
+                let fd_raw = convert_font_matrix(&fd_matrix.matrix.0, fd_matrix.scale);
+                top_raw * fd_raw
+            }
+            (None, Some(fd_matrix)) => {
+                // No explicit top matrix. Default top is [0.001, 0, 0, 0.001, 0, 0].
+                // FD matrix scaled by 1000 (as per hayro-font's behavior for
+                // non-explicit top matrix).
+                let default_top = default_cff_matrix();
+                let fd_raw = convert_font_matrix(&fd_matrix.matrix.0, fd_matrix.scale);
+                let scaled_fd = Affine::new([
+                    fd_raw.as_coeffs()[0] * 1000.0,
+                    fd_raw.as_coeffs()[1] * 1000.0,
+                    fd_raw.as_coeffs()[2] * 1000.0,
+                    fd_raw.as_coeffs()[3] * 1000.0,
+                    fd_raw.as_coeffs()[4] * 1000.0,
+                    fd_raw.as_coeffs()[5] * 1000.0,
+                ]);
+                default_top * scaled_fd
+            }
+            (Some(top_matrix), None) => {
+                // Top matrix set, no FD matrix → de-normalize and use directly.
+                convert_font_matrix(&top_matrix.matrix.0, top_matrix.scale)
+            }
+            (None, None) => {
+                // No explicit matrices → use the default CFF matrix [0.001, ...].
+                default_cff_matrix()
+            }
+        }
     }
 }
 
@@ -189,15 +247,27 @@ impl OpenTypeFontBlob {
     }
 }
 
-fn convert_matrix(matrix: Matrix) -> Affine {
+/// Convert a Type1 font matrix (Fixed[6]) to an Affine, accounting for upem.
+///
+/// The read-fonts Type1 font matrix is normalized such that the y-scale
+/// component is 1.0 (or -1.0), and the upem is extracted separately.
+/// The original hayro-font matrix stored the raw 0.001 scale factor in the
+/// matrix itself. To get equivalent behavior, we divide by upem.
+fn convert_font_matrix(matrix: &[Fixed; 6], upem: i32) -> Affine {
+    let scale = 1.0 / upem.max(1) as f64;
     Affine::new([
-        matrix.sx as f64,
-        matrix.ky as f64,
-        matrix.kx as f64,
-        matrix.sy as f64,
-        matrix.tx as f64,
-        matrix.ty as f64,
+        matrix[0].to_f64() * scale,
+        matrix[1].to_f64() * scale,
+        matrix[2].to_f64() * scale,
+        matrix[3].to_f64() * scale,
+        matrix[4].to_f64() * scale,
+        matrix[5].to_f64() * scale,
     ])
+}
+
+/// Returns the default CFF font matrix: [0.001, 0, 0, 0.001, 0, 0].
+fn default_cff_matrix() -> Affine {
+    Affine::new([0.001, 0.0, 0.0, 0.001, 0.0, 0.0])
 }
 
 #[derive(Yokeable, Clone)]
@@ -210,5 +280,5 @@ struct OTFYoke<'a> {
 
 #[derive(Yokeable, Clone)]
 struct CFFYoke<'a> {
-    table: cff::Table<'a>,
+    font: CffFontRef<'a>,
 }

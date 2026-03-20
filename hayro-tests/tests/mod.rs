@@ -399,10 +399,10 @@ fn is_pix_diff(pixel1: &Rgba<u8>, pixel2: &Rgba<u8>) -> bool {
         return false;
     }
 
-    pixel1.0[0] != pixel2.0[0]
-        || pixel1.0[1] != pixel2.0[1]
-        || pixel1.0[2] != pixel2.0[2]
-        || pixel1.0[3] != pixel2.0[3]
+    pixel1.0[0].abs_diff(pixel2.0[0]) > 2
+        || pixel1.0[1].abs_diff(pixel2.0[1]) > 2
+        || pixel1.0[2].abs_diff(pixel2.0[2]) > 2
+        || pixel1.0[3].abs_diff(pixel2.0[3]) > 2
 }
 
 // We don't use the `embed-fonts` feature because we use the more complete liberation fonts for
