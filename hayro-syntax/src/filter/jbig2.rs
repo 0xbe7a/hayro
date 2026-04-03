@@ -22,6 +22,12 @@ pub(crate) fn decode(
         .and_then(|g| g.decoded().ok());
 
     let image = hayro_jbig2::Image::new_embedded(data, globals.as_deref()).ok()?;
+    if image_params
+        .limits
+        .exceeded_by(image.width(), image.height())
+    {
+        return None;
+    }
 
     // Whenever possible (if we don't have an indexed color space), we convert
     // the data as 8-bit instead of 1-bit, so that it can be easier converted

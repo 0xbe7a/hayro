@@ -10,6 +10,7 @@ use crate::{FillRule, InterpreterWarning, WarningSinkFn, interpret};
 use crate::{ImageData, LumaData, RgbData};
 use hayro_syntax::bit_reader::BitReader;
 use hayro_syntax::content::TypedIter;
+use hayro_syntax::filter::ImageLimits;
 use hayro_syntax::object::Array;
 use hayro_syntax::object::Dict;
 use hayro_syntax::object::Name;
@@ -35,6 +36,7 @@ impl<'a> XObject<'a> {
         warning_sink: &WarningSinkFn,
         cache: &Cache,
         transfer_function: Option<ActiveTransferFunction>,
+        image_limits: ImageLimits,
     ) -> Option<Self> {
         let dict = stream.dict();
         match dict.get::<Name<'_>>(SUBTYPE)?.deref() {
@@ -45,6 +47,7 @@ impl<'a> XObject<'a> {
                 cache,
                 false,
                 transfer_function,
+                image_limits,
             )?)),
             FORM => Some(Self::FormXObject(FormXObject::new(stream)?)),
             _ => None,
@@ -274,6 +277,7 @@ pub(crate) struct ImageXObject<'a> {
     stream: Stream<'a>,
     transfer_function: Option<ActiveTransferFunction>,
     warning_sink: WarningSinkFn,
+    image_limits: ImageLimits,
 }
 
 impl<'a> ImageXObject<'a> {
@@ -284,6 +288,7 @@ impl<'a> ImageXObject<'a> {
         cache: &Cache,
         mut is_mask: bool,
         transfer_function: Option<ActiveTransferFunction>,
+        image_limits: ImageLimits,
     ) -> Option<Self> {
         let dict = stream.dict();
 
@@ -335,6 +340,7 @@ impl<'a> ImageXObject<'a> {
             stream: stream.clone(),
             is_mask,
             is_stencil_mask,
+            image_limits,
         })
     }
 
@@ -399,6 +405,10 @@ fn decode_context<'a>(
     obj: &ImageXObject<'a>,
     target_dimension: Option<(u32, u32)>,
 ) -> Option<DecodeContext<'a>> {
+    if obj.image_limits.exceeded_by(obj.width, obj.height) {
+        return None;
+    }
+
     let dict = obj.stream.dict();
     let dict_bpc = dict
         .get::<u8>(BPC)
@@ -413,6 +423,7 @@ fn decode_context<'a>(
         target_dimension,
         width: obj.width,
         height: obj.height,
+        limits: obj.image_limits,
     };
 
     let decoded = obj
@@ -746,7 +757,15 @@ fn resolve_alpha(
         .get::<Stream<'_>>(SMASK)
         .or_else(|| dict.get::<Stream<'_>>(MASK))
     {
-        let obj = ImageXObject::new(&s_mask, |_| None, &obj.warning_sink, &obj.cache, true, None)?;
+        let obj = ImageXObject::new(
+            &s_mask,
+            |_| None,
+            &obj.warning_sink,
+            &obj.cache,
+            true,
+            None,
+            obj.image_limits,
+        )?;
 
         decode_mask(&obj, target_dimension).map(|decoded| decoded.luma)
     } else if let Some(color_key_mask) = dict.get::<SmallVec<[u16; 4]>>(MASK) {
@@ -806,7 +825,15 @@ fn resolve_matte(
     let mut matte_rgb = [0_u8; 3];
     color_space.convert_f32(&matte, &mut matte_rgb, false);
 
-    let mask_obj = ImageXObject::new(&s_mask, |_| None, &obj.warning_sink, &obj.cache, true, None)?;
+    let mask_obj = ImageXObject::new(
+        &s_mask,
+        |_| None,
+        &obj.warning_sink,
+        &obj.cache,
+        true,
+        None,
+        obj.image_limits,
+    )?;
     let alpha = decode_mask(&mask_obj, target_dimension)?.luma;
 
     Some((alpha, matte_rgb))

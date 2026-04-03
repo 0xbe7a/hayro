@@ -17,6 +17,7 @@ use crate::x_object::{
 };
 use hayro_syntax::content::TypedIter;
 use hayro_syntax::content::ops::TypedInstruction;
+use hayro_syntax::filter::ImageLimits;
 use hayro_syntax::object::dict::keys::{ANNOTS, AP, F, MCID, N, OC, RECT};
 use hayro_syntax::object::{Array, Dict, Object, Rect, Stream, dict_or_stream};
 use hayro_syntax::page::{Page, Resources};
@@ -101,6 +102,8 @@ pub struct InterpreterSettings {
     /// Note that this feature is currently not fully implemented yet, so some
     /// annotations might be missing.
     pub render_annotations: bool,
+    /// Limits applied when decoding images.
+    pub image_limits: ImageLimits,
 }
 
 impl Default for InterpreterSettings {
@@ -119,6 +122,7 @@ impl Default for InterpreterSettings {
             cmap_resolver: Arc::new(|_| None),
             warning_sink: Arc::new(|_| {}),
             render_annotations: true,
+            image_limits: ImageLimits::default(),
         }
     }
 }
@@ -654,12 +658,14 @@ pub fn interpret<'a>(
             TypedInstruction::XObject(x) => {
                 let cache = context.object_cache.clone();
                 let transfer_function = context.get().graphics_state.transfer_function.clone();
+                let image_limits = context.settings.image_limits;
                 if let Some(x_object) = resources.get_x_object(x.0).and_then(|s| {
                     XObject::new(
                         &s,
                         &context.settings.warning_sink,
                         &cache,
                         transfer_function.clone(),
+                        image_limits,
                     )
                 }) {
                     draw_xobject(&x_object, resources, context, device);
@@ -669,6 +675,7 @@ pub fn interpret<'a>(
                 let warning_sink = context.settings.warning_sink.clone();
                 let transfer_function = context.get().graphics_state.transfer_function.clone();
                 let cache = context.object_cache.clone();
+                let image_limits = context.settings.image_limits;
                 if let Some(x_object) = ImageXObject::new(
                     i.0,
                     |name| context.get_color_space(resources, name),
@@ -676,6 +683,7 @@ pub fn interpret<'a>(
                     &cache,
                     false,
                     transfer_function,
+                    image_limits,
                 ) {
                     draw_image_xobject(&x_object, context, device);
                 }

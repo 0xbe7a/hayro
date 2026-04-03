@@ -17,9 +17,14 @@ pub(crate) fn decode(
 
     let rows = params.get::<u32>(ROWS).unwrap_or(image_params.height);
     let end_of_block = params.get::<bool>(END_OF_BLOCK).unwrap_or(true);
+    let columns = params.get::<usize>(COLUMNS).unwrap_or(1728) as u32;
+
+    if image_params.limits.exceeded_by(columns, rows) {
+        return None;
+    }
 
     let settings = DecodeSettings {
-        columns: params.get::<usize>(COLUMNS).unwrap_or(1728) as u32,
+        columns,
         rows,
         end_of_block,
         end_of_line: params.get::<bool>(END_OF_LINE).unwrap_or(false),

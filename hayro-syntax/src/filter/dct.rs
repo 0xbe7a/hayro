@@ -13,10 +13,6 @@ pub(crate) fn decode(
     params: &Dict<'_>,
     image_params: &ImageDecodeParams,
 ) -> Option<FilterResult<'static>> {
-    if image_params.width > u16::MAX as u32 || image_params.height > u16::MAX as u32 {
-        return None;
-    }
-
     // Some PDFs have weird JPEGs where the JPEG metadata is completely wrong
     // (for example indicating that one of the dimensions is u16::MAX), but the
     // metadata in the PDF image dictionary is correct. Therefore, we first
@@ -24,11 +20,17 @@ pub(crate) fn decode(
     // are too large (if they are too small, they will just be padded later on).
     let data = maybe_patch_jpeg_dimensions(data, image_params)?;
 
+    let (max_width, max_height) = image_params.limits.width_height();
     let options = DecoderOptions::default()
-        .set_max_width(u16::MAX as usize)
-        .set_max_height(u16::MAX as usize);
+        .set_max_width(max_width as usize)
+        .set_max_height(max_height as usize);
     let mut decoder = zune_jpeg::JpegDecoder::new_with_options(ZCursor::new(&*data), options);
     decoder.decode_headers().ok()?;
+    let (width, height) = decoder.dimensions()?;
+    let (width, height) = (width as u32, height as u32);
+    if image_params.limits.exceeded_by(width, height) {
+        return None;
+    }
 
     let color_transform = params.get::<u8>(COLOR_TRANSFORM);
     let input_color_space = decoder.input_colorspace().unwrap();
@@ -74,9 +76,6 @@ pub(crate) fn decode(
             c[2] = (481.816 - y - 1.772 * cb) as u8;
         }
     }
-
-    let width = decoder.dimensions().unwrap().0 as u32;
-    let height = decoder.dimensions().unwrap().1 as u32;
 
     let image_data = ImageData {
         alpha: None,

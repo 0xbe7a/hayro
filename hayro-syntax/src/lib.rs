@@ -86,7 +86,7 @@ pub(crate) mod math;
 pub(crate) mod sync;
 
 mod data;
-pub(crate) mod filter;
+pub mod filter;
 pub(crate) mod pdf;
 pub(crate) mod trivia;
 pub(crate) mod util;

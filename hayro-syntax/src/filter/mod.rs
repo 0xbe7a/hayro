@@ -19,6 +19,42 @@ use crate::object::dict::keys::*;
 use crate::object::stream::{DecodeFailure, FilterResult, ImageDecodeParams};
 use core::ops::Deref;
 
+/// Limits that are applied when decoding images.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum ImageLimits {
+    /// Limit image width and height independently.
+    WidthHeight(u16, u16),
+    /// Limit the total number of pixels.
+    TotalPixels(u32),
+}
+
+impl Default for ImageLimits {
+    fn default() -> Self {
+        Self::WidthHeight(u16::MAX, u16::MAX)
+    }
+}
+
+impl ImageLimits {
+    #[doc(hidden)]
+    pub fn exceeded_by(self, width: u32, height: u32) -> bool {
+        match self {
+            Self::WidthHeight(max_width, max_height) => {
+                width > max_width as u32 || height > max_height as u32
+            }
+            Self::TotalPixels(max_pixels) => width
+                .checked_mul(height)
+                .is_none_or(|pixels| pixels > max_pixels),
+        }
+    }
+
+    pub(crate) fn width_height(self) -> (u16, u16) {
+        match self {
+            Self::WidthHeight(width, height) => (width, height),
+            Self::TotalPixels(_) => (u16::MAX, u16::MAX),
+        }
+    }
+}
+
 /// A data filter.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum Filter {

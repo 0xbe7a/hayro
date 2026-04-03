@@ -31,6 +31,9 @@ pub(crate) fn decode(data: &[u8], params: &ImageDecodeParams) -> Option<FilterRe
 
     let width = image.width();
     let height = image.height();
+    if params.limits.exceeded_by(width, height) {
+        return None;
+    }
     let bpc = params.bpc.unwrap_or(image.original_bit_depth());
     let cs = match image.color_space() {
         ColorSpace::Gray => ImageColorSpace::Gray,

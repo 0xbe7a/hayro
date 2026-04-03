@@ -2,6 +2,7 @@
 
 use crate::crypto::DecryptionTarget;
 use crate::filter::Filter;
+use crate::filter::ImageLimits;
 use crate::object;
 use crate::object::Dict;
 use crate::object::Name;
@@ -52,6 +53,8 @@ pub struct ImageDecodeParams {
     pub width: u32,
     /// The height of the image as indicated by the image dictionary.
     pub height: u32,
+    /// The limits that should be applied during decoding.
+    pub limits: ImageLimits,
 }
 
 impl<'a> Stream<'a> {
