@@ -99,14 +99,15 @@ fn decode_inner(
         // Only one termination per code block, so we can just decode the
         // whole range in one single go, processing all coding passes at once.
         let mut decoder = ArithmeticDecoder::new(&bp_buffers.combined_layers);
-        handle_coding_passes(
-            0,
-            code_block
-                .number_of_coding_passes
-                .min(ctx.max_coding_passes),
-            ctx,
-            &mut decoder,
-        )?;
+        let end = code_block
+            .number_of_coding_passes
+            .min(ctx.max_coding_passes);
+
+        if fast_path::can_decode_full_stripes_non_vsc(ctx) {
+            fast_path::handle_coding_passes_full_stripes_non_vsc(0, end, ctx, &mut decoder)?;
+        } else {
+            handle_coding_passes(0, end, ctx, &mut decoder)?;
+        }
     } else {
         // Otherwise, each segment introduces a termination. For "termination on
         // each pass", each segment only covers one coding pass
@@ -359,6 +360,8 @@ impl BitPlaneDecodeBuffers {
 pub(crate) struct BitPlaneDecodeContext {
     /// A vector of bit-packed fields for each coefficient in the code-block.
     coefficient_states: Vec<CoefficientState>,
+    /// OpenJPEG-style stripe flags used by the specialized arithmetic stripe path.
+    stripe_flags: Vec<u32>,
     /// The neighbor significances for each coefficient.
     neighbor_significances: Vec<NeighborSignificances>,
     /// The magnitude and signs of each coefficient that is successively built
@@ -390,6 +393,7 @@ impl Default for BitPlaneDecodeContext {
     fn default() -> Self {
         Self {
             coefficient_states: vec![],
+            stripe_flags: vec![],
             coefficients: vec![],
             neighbor_significances: vec![],
             width: 0,
@@ -432,6 +436,8 @@ impl BitPlaneDecodeContext {
         self.coefficient_states.clear();
         self.coefficient_states
             .resize(num_coefficients, CoefficientState::default());
+
+        fast_path::reset_stripe_flags(self, height, padded_width);
 
         self.width = width;
         self.padded_width = padded_width;
@@ -1016,5 +1022,703 @@ impl BitDecoder for BypassDecoder<'_> {
                 None
             }
         })
+    }
+}
+
+mod fast_path {
+    use super::{
+        ArithmeticDecoder, BitPlaneDecodeContext, SIGN_CONTEXT_LOOKUP, SubBandType,
+        ZERO_CTX_HH_LOOKUP, ZERO_CTX_HL_LOOKUP, ZERO_CTX_LL_LH_LOOKUP,
+    };
+
+    pub(super) fn reset_stripe_flags(
+        ctx: &mut BitPlaneDecodeContext,
+        height: u32,
+        padded_width: u32,
+    ) {
+        ctx.stripe_flags.clear();
+        ctx.stripe_flags
+            .resize((height.div_ceil(4) + 2) as usize * padded_width as usize, 0);
+    }
+
+    #[inline(always)]
+    pub(super) fn can_decode_full_stripes_non_vsc(ctx: &BitPlaneDecodeContext) -> bool {
+        ctx.width > 0
+            && ctx.height > 0
+            && ctx.height.is_multiple_of(4)
+            && !ctx.style.vertically_causal_context
+    }
+
+    pub(super) fn handle_coding_passes_full_stripes_non_vsc(
+        start: u8,
+        end: u8,
+        ctx: &mut BitPlaneDecodeContext,
+        decoder: &mut ArithmeticDecoder<'_>,
+    ) -> Option<()> {
+        debug_assert!(ctx.width > 0);
+        debug_assert!(ctx.height > 0);
+        debug_assert!(ctx.height.is_multiple_of(4));
+        debug_assert!(!ctx.style.vertically_causal_context);
+
+        let reset_context_probabilities = ctx.style.reset_context_probabilities;
+
+        for coding_pass in start..end {
+            let current_bitplane = coding_pass.div_ceil(3);
+            ctx.current_bit_position = ctx.bitplanes - 1 - current_bitplane;
+
+            match coding_pass % 3 {
+                0 => {
+                    cleanup_pass_full_stripes_non_vsc(ctx, decoder);
+
+                    if ctx.style.segmentation_symbols {
+                        let b0 = read_arithmetic_bit(ctx, decoder, 18);
+                        let b1 = read_arithmetic_bit(ctx, decoder, 18);
+                        let b2 = read_arithmetic_bit(ctx, decoder, 18);
+                        let b3 = read_arithmetic_bit(ctx, decoder, 18);
+
+                        if (b0 != 1 || b1 != 0 || b2 != 1 || b3 != 0) && ctx.strict {
+                            return None;
+                        }
+                    }
+
+                    stripe_reset_for_next_bitplane(ctx);
+                }
+                1 => significance_propagation_pass_full_stripes_non_vsc(ctx, decoder),
+                2 => magnitude_refinement_pass_full_stripes_non_vsc(ctx, decoder),
+                _ => unreachable!(),
+            }
+
+            if reset_context_probabilities {
+                ctx.reset_contexts();
+            }
+        }
+
+        Some(())
+    }
+
+    fn cleanup_pass_full_stripes_non_vsc(
+        ctx: &mut BitPlaneDecodeContext,
+        decoder: &mut ArithmeticDecoder<'_>,
+    ) {
+        let zero_contexts = zero_context_stripe_lookup(ctx.sub_band_type);
+        let width = ctx.width as usize;
+        let stride = ctx.padded_width as usize;
+        let stripe_count = (ctx.height / 4) as usize;
+
+        for stripe in 0..stripe_count {
+            let flag_base = stripe_flag_base(stripe, stride);
+            let coefficient_base = stripe_coefficient_base(stripe, stride);
+            for x in 0..width {
+                let flag_idx = flag_base + x;
+                let mut flags = ctx.stripe_flags[flag_idx];
+
+                if flags == 0 {
+                    if read_arithmetic_bit(ctx, decoder, 17) == 0 {
+                        continue;
+                    }
+
+                    let run_length = (read_arithmetic_bit(ctx, decoder, 18) << 1)
+                        | read_arithmetic_bit(ctx, decoder, 18);
+
+                    match run_length {
+                        0 => {
+                            cleanup_step_full_stripes_non_vsc(
+                                ctx,
+                                decoder,
+                                zero_contexts,
+                                flag_idx,
+                                &mut flags,
+                                coefficient_base + x,
+                                stride,
+                                0,
+                                false,
+                                true,
+                            );
+                            cleanup_step_full_stripes_non_vsc(
+                                ctx,
+                                decoder,
+                                zero_contexts,
+                                flag_idx,
+                                &mut flags,
+                                coefficient_base + x,
+                                stride,
+                                1,
+                                false,
+                                false,
+                            );
+                            cleanup_step_full_stripes_non_vsc(
+                                ctx,
+                                decoder,
+                                zero_contexts,
+                                flag_idx,
+                                &mut flags,
+                                coefficient_base + x,
+                                stride,
+                                2,
+                                false,
+                                false,
+                            );
+                            cleanup_step_full_stripes_non_vsc(
+                                ctx,
+                                decoder,
+                                zero_contexts,
+                                flag_idx,
+                                &mut flags,
+                                coefficient_base + x,
+                                stride,
+                                3,
+                                false,
+                                false,
+                            );
+                        }
+                        1 => {
+                            cleanup_step_full_stripes_non_vsc(
+                                ctx,
+                                decoder,
+                                zero_contexts,
+                                flag_idx,
+                                &mut flags,
+                                coefficient_base + x,
+                                stride,
+                                1,
+                                false,
+                                true,
+                            );
+                            cleanup_step_full_stripes_non_vsc(
+                                ctx,
+                                decoder,
+                                zero_contexts,
+                                flag_idx,
+                                &mut flags,
+                                coefficient_base + x,
+                                stride,
+                                2,
+                                false,
+                                false,
+                            );
+                            cleanup_step_full_stripes_non_vsc(
+                                ctx,
+                                decoder,
+                                zero_contexts,
+                                flag_idx,
+                                &mut flags,
+                                coefficient_base + x,
+                                stride,
+                                3,
+                                false,
+                                false,
+                            );
+                        }
+                        2 => {
+                            cleanup_step_full_stripes_non_vsc(
+                                ctx,
+                                decoder,
+                                zero_contexts,
+                                flag_idx,
+                                &mut flags,
+                                coefficient_base + x,
+                                stride,
+                                2,
+                                false,
+                                true,
+                            );
+                            cleanup_step_full_stripes_non_vsc(
+                                ctx,
+                                decoder,
+                                zero_contexts,
+                                flag_idx,
+                                &mut flags,
+                                coefficient_base + x,
+                                stride,
+                                3,
+                                false,
+                                false,
+                            );
+                        }
+                        _ => cleanup_step_full_stripes_non_vsc(
+                            ctx,
+                            decoder,
+                            zero_contexts,
+                            flag_idx,
+                            &mut flags,
+                            coefficient_base + x,
+                            stride,
+                            3,
+                            false,
+                            true,
+                        ),
+                    }
+                } else {
+                    cleanup_step_full_stripes_non_vsc(
+                        ctx,
+                        decoder,
+                        zero_contexts,
+                        flag_idx,
+                        &mut flags,
+                        coefficient_base + x,
+                        stride,
+                        0,
+                        true,
+                        false,
+                    );
+                    cleanup_step_full_stripes_non_vsc(
+                        ctx,
+                        decoder,
+                        zero_contexts,
+                        flag_idx,
+                        &mut flags,
+                        coefficient_base + x,
+                        stride,
+                        1,
+                        true,
+                        false,
+                    );
+                    cleanup_step_full_stripes_non_vsc(
+                        ctx,
+                        decoder,
+                        zero_contexts,
+                        flag_idx,
+                        &mut flags,
+                        coefficient_base + x,
+                        stride,
+                        2,
+                        true,
+                        false,
+                    );
+                    cleanup_step_full_stripes_non_vsc(
+                        ctx,
+                        decoder,
+                        zero_contexts,
+                        flag_idx,
+                        &mut flags,
+                        coefficient_base + x,
+                        stride,
+                        3,
+                        true,
+                        false,
+                    );
+                }
+
+                ctx.stripe_flags[flag_idx] = flags & !STRIPE_PI_ALL;
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn cleanup_step_full_stripes_non_vsc(
+        ctx: &mut BitPlaneDecodeContext,
+        decoder: &mut ArithmeticDecoder<'_>,
+        zero_contexts: &[u8; 512],
+        flag_idx: usize,
+        flags: &mut u32,
+        coefficient_idx: usize,
+        stride: usize,
+        ci: u32,
+        check_flags: bool,
+        partial: bool,
+    ) {
+        debug_assert!(ci < 4);
+        let shift = ci * 3;
+
+        if !check_flags || (*flags & ((STRIPE_SIGMA_THIS | STRIPE_PI_THIS) << shift)) == 0 {
+            if !partial {
+                let ctx_label =
+                    zero_contexts[((*flags >> shift) & STRIPE_SIGMA_NEIGHBOURS) as usize];
+                if read_arithmetic_bit(ctx, decoder, ctx_label) == 0 {
+                    return;
+                }
+            }
+
+            let sign = decode_sign_bit_stripe(flag_idx, *flags, ci, ctx, decoder);
+            let coefficient_idx = coefficient_idx + ci as usize * stride;
+            push_magnitude_bit_idx(ctx, coefficient_idx, 1);
+            set_sign_idx(ctx, coefficient_idx, sign as u8);
+            stripe_set_significant(ctx, flag_idx, flags, ci, sign, stride);
+        }
+    }
+
+    fn significance_propagation_pass_full_stripes_non_vsc(
+        ctx: &mut BitPlaneDecodeContext,
+        decoder: &mut ArithmeticDecoder<'_>,
+    ) {
+        let zero_contexts = zero_context_stripe_lookup(ctx.sub_band_type);
+        let width = ctx.width as usize;
+        let stride = ctx.padded_width as usize;
+        let stripe_count = (ctx.height / 4) as usize;
+
+        for stripe in 0..stripe_count {
+            let flag_base = stripe_flag_base(stripe, stride);
+            let coefficient_base = stripe_coefficient_base(stripe, stride);
+
+            for x in 0..width {
+                let flag_idx = flag_base + x;
+                let mut flags = ctx.stripe_flags[flag_idx];
+
+                if flags != 0 {
+                    significance_step_full_stripes_non_vsc(
+                        ctx,
+                        decoder,
+                        zero_contexts,
+                        flag_idx,
+                        &mut flags,
+                        coefficient_base + x,
+                        stride,
+                        0,
+                    );
+                    significance_step_full_stripes_non_vsc(
+                        ctx,
+                        decoder,
+                        zero_contexts,
+                        flag_idx,
+                        &mut flags,
+                        coefficient_base + x,
+                        stride,
+                        1,
+                    );
+                    significance_step_full_stripes_non_vsc(
+                        ctx,
+                        decoder,
+                        zero_contexts,
+                        flag_idx,
+                        &mut flags,
+                        coefficient_base + x,
+                        stride,
+                        2,
+                    );
+                    significance_step_full_stripes_non_vsc(
+                        ctx,
+                        decoder,
+                        zero_contexts,
+                        flag_idx,
+                        &mut flags,
+                        coefficient_base + x,
+                        stride,
+                        3,
+                    );
+                }
+
+                ctx.stripe_flags[flag_idx] = flags;
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn significance_step_full_stripes_non_vsc(
+        ctx: &mut BitPlaneDecodeContext,
+        decoder: &mut ArithmeticDecoder<'_>,
+        zero_contexts: &[u8; 512],
+        flag_idx: usize,
+        flags: &mut u32,
+        coefficient_idx: usize,
+        stride: usize,
+        ci: u32,
+    ) {
+        debug_assert!(ci < 4);
+        let shift = ci * 3;
+        let shifted_flags = *flags >> shift;
+
+        if shifted_flags & (STRIPE_SIGMA_THIS | STRIPE_PI_THIS) == 0
+            && shifted_flags & STRIPE_SIGMA_NEIGHBOURS != 0
+        {
+            let ctx_label = zero_contexts[(shifted_flags & STRIPE_SIGMA_NEIGHBOURS) as usize];
+            let bit = read_arithmetic_bit(ctx, decoder, ctx_label);
+            *flags |= STRIPE_PI_THIS << shift;
+
+            if bit == 1 {
+                let coefficient_idx = coefficient_idx + ci as usize * stride;
+                let sign = decode_sign_bit_stripe(flag_idx, *flags, ci, ctx, decoder);
+                push_magnitude_bit_idx(ctx, coefficient_idx, 1);
+                set_sign_idx(ctx, coefficient_idx, sign as u8);
+                stripe_set_significant(ctx, flag_idx, flags, ci, sign, stride);
+            }
+        }
+    }
+
+    fn magnitude_refinement_pass_full_stripes_non_vsc(
+        ctx: &mut BitPlaneDecodeContext,
+        decoder: &mut ArithmeticDecoder<'_>,
+    ) {
+        let width = ctx.width as usize;
+        let stride = ctx.padded_width as usize;
+        let stripe_count = (ctx.height / 4) as usize;
+
+        for stripe in 0..stripe_count {
+            let flag_base = stripe_flag_base(stripe, stride);
+            let coefficient_base = stripe_coefficient_base(stripe, stride);
+            for x in 0..width {
+                let flag_idx = flag_base + x;
+                let mut flags = ctx.stripe_flags[flag_idx];
+
+                if flags != 0 {
+                    magnitude_refinement_step_full_stripes_non_vsc(
+                        ctx,
+                        decoder,
+                        &mut flags,
+                        coefficient_base + x,
+                        stride,
+                        0,
+                    );
+                    magnitude_refinement_step_full_stripes_non_vsc(
+                        ctx,
+                        decoder,
+                        &mut flags,
+                        coefficient_base + x,
+                        stride,
+                        1,
+                    );
+                    magnitude_refinement_step_full_stripes_non_vsc(
+                        ctx,
+                        decoder,
+                        &mut flags,
+                        coefficient_base + x,
+                        stride,
+                        2,
+                    );
+                    magnitude_refinement_step_full_stripes_non_vsc(
+                        ctx,
+                        decoder,
+                        &mut flags,
+                        coefficient_base + x,
+                        stride,
+                        3,
+                    );
+                }
+
+                ctx.stripe_flags[flag_idx] = flags;
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn magnitude_refinement_step_full_stripes_non_vsc(
+        ctx: &mut BitPlaneDecodeContext,
+        decoder: &mut ArithmeticDecoder<'_>,
+        flags: &mut u32,
+        coefficient_idx: usize,
+        stride: usize,
+        ci: u32,
+    ) {
+        debug_assert!(ci < 4);
+        let shift = ci * 3;
+        let shifted_flags = *flags >> shift;
+
+        if shifted_flags & (STRIPE_SIGMA_THIS | STRIPE_PI_THIS) == STRIPE_SIGMA_THIS {
+            let ctx_label = context_label_magnitude_refinement_coding_stripe(shifted_flags);
+            let bit = read_arithmetic_bit(ctx, decoder, ctx_label);
+            if bit == 1 {
+                push_magnitude_bit_idx(ctx, coefficient_idx + ci as usize * stride, 1);
+            }
+            *flags |= STRIPE_MU_THIS << shift;
+        }
+    }
+
+    #[inline(always)]
+    fn decode_sign_bit_stripe(
+        flag_idx: usize,
+        flags: u32,
+        ci: u32,
+        ctx: &mut BitPlaneDecodeContext,
+        decoder: &mut ArithmeticDecoder<'_>,
+    ) -> u32 {
+        debug_assert!(ci < 4);
+        let shift = ci * 3;
+        let shifted_flags = flags >> shift;
+        let left_flags = ctx.stripe_flags[flag_idx - 1];
+        let right_flags = ctx.stripe_flags[flag_idx + 1];
+
+        let top_sign = if ci == 0 {
+            (flags >> STRIPE_CHI_0_I) & 1
+        } else {
+            (flags >> (STRIPE_CHI_THIS_I + (ci - 1) * 3)) & 1
+        };
+        let bottom_sign = if ci == 3 {
+            (flags >> STRIPE_CHI_5_I) & 1
+        } else {
+            (flags >> (STRIPE_CHI_S_I + ci * 3)) & 1
+        };
+        let left_sign = (left_flags >> (STRIPE_CHI_THIS_I + shift)) & 1;
+        let right_sign = (right_flags >> (STRIPE_CHI_THIS_I + shift)) & 1;
+
+        let lu = left_sign
+            | (((shifted_flags & STRIPE_SIGMA_N) != 0) as u32) << 1
+            | (right_sign << 2)
+            | (((shifted_flags & STRIPE_SIGMA_W) != 0) as u32) << 3
+            | (top_sign << 4)
+            | (((shifted_flags & STRIPE_SIGMA_E) != 0) as u32) << 5
+            | (bottom_sign << 6)
+            | (((shifted_flags & STRIPE_SIGMA_S) != 0) as u32) << 7;
+
+        let (ctx_label, xor_bit) = SIGN_CONTEXT_STRIPE_LOOKUP[lu as usize];
+        read_arithmetic_bit(ctx, decoder, ctx_label) ^ xor_bit as u32
+    }
+
+    #[inline(always)]
+    fn zero_context_stripe_lookup(sub_band_type: SubBandType) -> &'static [u8; 512] {
+        match sub_band_type {
+            SubBandType::LowLow | SubBandType::LowHigh => &ZERO_CTX_LL_LH_STRIPE_LOOKUP,
+            SubBandType::HighLow => &ZERO_CTX_HL_STRIPE_LOOKUP,
+            SubBandType::HighHigh => &ZERO_CTX_HH_STRIPE_LOOKUP,
+        }
+    }
+
+    #[inline(always)]
+    fn context_label_magnitude_refinement_coding_stripe(flags: u32) -> u8 {
+        if flags & STRIPE_MU_THIS != 0 {
+            16
+        } else {
+            14 + ((flags & STRIPE_SIGMA_NEIGHBOURS != 0) as u8)
+        }
+    }
+
+    #[inline(always)]
+    fn stripe_reset_for_next_bitplane(ctx: &mut BitPlaneDecodeContext) {
+        for flags in &mut ctx.stripe_flags {
+            *flags &= !STRIPE_PI_ALL;
+        }
+    }
+
+    #[inline(always)]
+    fn read_arithmetic_bit(
+        ctx: &mut BitPlaneDecodeContext,
+        decoder: &mut ArithmeticDecoder<'_>,
+        ctx_label: u8,
+    ) -> u32 {
+        decoder.read_bit(&mut ctx.contexts[ctx_label as usize])
+    }
+
+    #[inline(always)]
+    fn push_magnitude_bit_idx(ctx: &mut BitPlaneDecodeContext, idx: usize, bit: u32) {
+        ctx.coefficients[idx].push_bit_at(bit, ctx.current_bit_position);
+    }
+
+    #[inline(always)]
+    fn set_sign_idx(ctx: &mut BitPlaneDecodeContext, idx: usize, sign: u8) {
+        ctx.coefficients[idx].set_sign(sign);
+    }
+
+    const STRIPE_SIGMA_NW: u32 = 1 << 0;
+    const STRIPE_SIGMA_N: u32 = 1 << 1;
+    const STRIPE_SIGMA_NE: u32 = 1 << 2;
+    const STRIPE_SIGMA_W: u32 = 1 << 3;
+    const STRIPE_SIGMA_THIS: u32 = 1 << 4;
+    const STRIPE_SIGMA_E: u32 = 1 << 5;
+    const STRIPE_SIGMA_SW: u32 = 1 << 6;
+    const STRIPE_SIGMA_S: u32 = 1 << 7;
+    const STRIPE_SIGMA_SE: u32 = 1 << 8;
+    const STRIPE_SIGMA_NEIGHBOURS: u32 = STRIPE_SIGMA_NW
+        | STRIPE_SIGMA_N
+        | STRIPE_SIGMA_NE
+        | STRIPE_SIGMA_W
+        | STRIPE_SIGMA_E
+        | STRIPE_SIGMA_SW
+        | STRIPE_SIGMA_S
+        | STRIPE_SIGMA_SE;
+    const STRIPE_CHI_0_I: u32 = 18;
+    const STRIPE_CHI_THIS_I: u32 = 19;
+    const STRIPE_MU_THIS: u32 = 1 << 20;
+    const STRIPE_PI_THIS: u32 = 1 << 21;
+    const STRIPE_CHI_S_I: u32 = 22;
+    const STRIPE_CHI_5_I: u32 = 31;
+    const STRIPE_PI_ALL: u32 = (1 << 21) | (1 << 24) | (1 << 27) | (1 << 30);
+
+    #[inline(always)]
+    fn stripe_flag_base(stripe: usize, stride: usize) -> usize {
+        (stripe + 1) * stride + 1
+    }
+
+    #[inline(always)]
+    fn stripe_coefficient_base(stripe: usize, stride: usize) -> usize {
+        (stripe * 4 + 1) * stride + 1
+    }
+
+    #[inline(always)]
+    fn stripe_set_significant(
+        ctx: &mut BitPlaneDecodeContext,
+        flag_idx: usize,
+        flags: &mut u32,
+        ci: u32,
+        sign: u32,
+        stride: usize,
+    ) {
+        debug_assert!(ci < 4);
+        let shift = ci * 3;
+
+        ctx.stripe_flags[flag_idx - 1] |= STRIPE_SIGMA_E << shift;
+        *flags |= ((sign << STRIPE_CHI_THIS_I) | STRIPE_SIGMA_THIS) << shift;
+        ctx.stripe_flags[flag_idx + 1] |= STRIPE_SIGMA_W << shift;
+
+        if ci == 0 {
+            let north = flag_idx - stride;
+            ctx.stripe_flags[north] |= (sign << STRIPE_CHI_5_I) | (1 << 16);
+            ctx.stripe_flags[north - 1] |= 1 << 17;
+            ctx.stripe_flags[north + 1] |= 1 << 15;
+        }
+
+        if ci == 3 {
+            let south = flag_idx + stride;
+            ctx.stripe_flags[south] |= (sign << STRIPE_CHI_0_I) | STRIPE_SIGMA_N;
+            ctx.stripe_flags[south - 1] |= STRIPE_SIGMA_NE;
+            ctx.stripe_flags[south + 1] |= STRIPE_SIGMA_NW;
+        }
+    }
+
+    const SIGN_CONTEXT_STRIPE_LOOKUP: [(u8, u8); 256] = build_stripe_sign_context_lookup();
+
+    const fn build_stripe_sign_context_lookup() -> [(u8, u8); 256] {
+        let mut out = [(0, 0); 256];
+        let mut lu = 0;
+
+        while lu < 256 {
+            let left_sign = lu & 1;
+            let top_significance = (lu >> 1) & 1;
+            let right_sign = (lu >> 2) & 1;
+            let left_significance = (lu >> 3) & 1;
+            let top_sign = (lu >> 4) & 1;
+            let right_significance = (lu >> 5) & 1;
+            let bottom_sign = (lu >> 6) & 1;
+            let bottom_significance = (lu >> 7) & 1;
+
+            let significances = (top_significance << 6)
+                | (left_significance << 4)
+                | (right_significance << 2)
+                | bottom_significance;
+            let signs = (top_sign << 6) | (left_sign << 4) | (right_sign << 2) | bottom_sign;
+            let merged_significances = ((significances & signs) << 1) | (significances & !signs);
+
+            out[lu] = SIGN_CONTEXT_LOOKUP[merged_significances];
+            lu += 1;
+        }
+
+        out
+    }
+
+    const ZERO_CTX_LL_LH_STRIPE_LOOKUP: [u8; 512] =
+        build_stripe_zero_context_lookup(ZERO_CTX_LL_LH_LOOKUP);
+    const ZERO_CTX_HL_STRIPE_LOOKUP: [u8; 512] =
+        build_stripe_zero_context_lookup(ZERO_CTX_HL_LOOKUP);
+    const ZERO_CTX_HH_STRIPE_LOOKUP: [u8; 512] =
+        build_stripe_zero_context_lookup(ZERO_CTX_HH_LOOKUP);
+
+    const fn build_stripe_zero_context_lookup(source: [u8; 256]) -> [u8; 512] {
+        let mut out = [0; 512];
+        let mut flags = 0;
+
+        while flags < 512 {
+            out[flags] = source[stripe_neighbor_byte(flags)];
+            flags += 1;
+        }
+
+        out
+    }
+
+    const fn stripe_neighbor_byte(flags: usize) -> usize {
+        ((((flags & STRIPE_SIGMA_NW as usize) != 0) as usize) << 7)
+            | ((((flags & STRIPE_SIGMA_N as usize) != 0) as usize) << 6)
+            | ((((flags & STRIPE_SIGMA_NE as usize) != 0) as usize) << 5)
+            | ((((flags & STRIPE_SIGMA_W as usize) != 0) as usize) << 4)
+            | ((((flags & STRIPE_SIGMA_SW as usize) != 0) as usize) << 3)
+            | ((((flags & STRIPE_SIGMA_E as usize) != 0) as usize) << 2)
+            | ((((flags & STRIPE_SIGMA_SE as usize) != 0) as usize) << 1)
+            | (((flags & STRIPE_SIGMA_S as usize) != 0) as usize)
     }
 }
